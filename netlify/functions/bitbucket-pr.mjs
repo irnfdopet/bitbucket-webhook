@@ -180,6 +180,10 @@ function escapeSlack(value) {
  * Slack member ID via email (nickname@domain) and posts a real @mention.
  */
 async function formatReviewers(pr) {
+  // Temporary override: comma-separated Slack member IDs (skips email lookup).
+  const hardcodedMentions = formatHardcodedMemberMentions();
+  if (hardcodedMentions) return hardcodedMentions;
+
   const fromReviewers = Array.isArray(pr.reviewers) ? pr.reviewers : [];
   const fromParticipants = Array.isArray(pr.participants)
     ? pr.participants
@@ -196,12 +200,27 @@ async function formatReviewers(pr) {
 }
 
 /**
+ * Parse SLACK_MEMBER_ID as one or more IDs separated by commas or spaces.
+ * Example: U09FCP6R402,U012ABCDEF
+ */
+function formatHardcodedMemberMentions() {
+  const raw = (process.env.SLACK_MEMBER_ID || "").trim();
+  if (!raw) return null;
+
+  const ids = raw.split(/[\s,]+/).map((id) => id.trim()).filter(Boolean);
+  if (ids.length === 0) return null;
+
+  return ids.map((id) => `<@${id}>`).join(", ");
+}
+
+/**
  * Prefer a real Slack @mention when we can map Bitbucket → company email → Slack user.
  * Falls back to display name when lookup is unavailable or fails.
  */
 async function resolveReviewerMention(user) {
   const display =
     user.display_name || user.nickname || user.username || "Unknown";
+
   const email = guessCompanyEmail(user);
   if (!email) return escapeSlack(display);
 
