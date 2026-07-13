@@ -1,0 +1,13 @@
+{
+  "name": "bitbucket-webhook",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Notify Slack when a Bitbucket pull request is created",
+  "scripts": {
+    "dev": "netlify dev",
+    "build": "echo 'No build step required'"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
