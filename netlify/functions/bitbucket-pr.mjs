@@ -1,13 +1,20 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
+/** Only process PRs from this Bitbucket workspace/repo. */
 const EXPECTED_REPO = "vetstoria/rnd";
+
+/** Bitbucket Cloud event key for a newly opened pull request. */
 const PR_CREATED = "pullrequest:created";
 
 /**
+ * Netlify Function entrypoint.
+ * Bitbucket POSTs here on PR create; we forward a short summary to Slack.
+ *
  * @param {import('@netlify/functions').HandlerEvent} event
  * @returns {Promise<import('@netlify/functions').HandlerResponse>}
  */
 export async function handler(event) {
+  // Health check / browser probe — confirms the route is live.
   if (event.httpMethod === "GET") {
     return json(200, {
       ok: true,
@@ -25,10 +32,12 @@ export async function handler(event) {
     return json(500, { error: "Server misconfigured" });
   }
 
+  // Netlify may base64-encode the body; always work from a UTF-8 string for HMAC + JSON.
   const rawBody = event.isBase64Encoded
     ? Buffer.from(event.body || "", "base64").toString("utf8")
     : event.body || "";
 
+  // If a secret is configured, reject unsigned or tampered requests.
   const webhookSecret = process.env.BITBUCKET_WEBHOOK_SECRET;
   if (webhookSecret) {
     const signature = header(event, "x-hub-signature");
@@ -44,11 +53,13 @@ export async function handler(event) {
     return json(400, { error: "Invalid JSON body" });
   }
 
+  // Prefer the X-Event-Key header Bitbucket sends; payload.eventKey is a fallback.
   const eventKey =
     header(event, "x-event-key") ||
     payload.eventKey ||
     "";
 
+  // Return 200 for ignored events so Bitbucket does not retry them.
   if (eventKey && eventKey !== PR_CREATED) {
     return json(200, { ok: true, ignored: true, reason: `Unhandled event: ${eventKey}` });
   }
@@ -73,6 +84,7 @@ export async function handler(event) {
     return json(400, { error: "Missing pullrequest in payload" });
   }
 
+  // Flatten the PR fields we care about for the Slack message.
   const actor = payload.actor?.display_name || payload.actor?.nickname || "Someone";
   const title = pr.title || "Untitled PR";
   const id = pr.id;
@@ -83,13 +95,15 @@ export async function handler(event) {
   const link =
     pr.links?.html?.href ||
     `https://bitbucket.org/${EXPECTED_REPO}/pull-requests/${id}`;
+  const reviewers = await formatReviewers(pr);
 
   const text = [
-    `*New pull request in \`${EXPECTED_REPO}\`*`,
+    `*New pull request in \`${EXPECTED_REPO}\`*. Please review when you have a moment:\n`,
     `*<${link}|#${id}: ${escapeSlack(title)}>*`,
     `• Author: ${escapeSlack(author)}`,
-    `• ${escapeSlack(source)} → ${escapeSlack(destination)}`,
+    `• Branch: ${escapeSlack(source)} → ${escapeSlack(destination)}`,
     `• Opened by: ${escapeSlack(actor)}`,
+    `• Reviewers: ${reviewers}`,
   ].join("\n");
 
   const slackResponse = await fetch(slackWebhookUrl, {
@@ -112,6 +126,8 @@ export async function handler(event) {
 }
 
 /**
+ * Case-insensitive header lookup (Netlify may normalize header names differently).
+ *
  * @param {import('@netlify/functions').HandlerEvent} event
  * @param {string} name
  */
@@ -127,8 +143,8 @@ function header(event, name) {
 }
 
 /**
- * Bitbucket Cloud signs the body with HMAC-SHA256 when a webhook secret is set.
- * Header format: sha256=<hex digest>
+ * Verify Bitbucket Cloud HMAC-SHA256 signature when a webhook secret is set.
+ * Expected header format: `X-Hub-Signature: sha256=<hex digest>`
  */
 function verifyBitbucketSignature(rawBody, signatureHeader, secret) {
   if (!signatureHeader || !signatureHeader.startsWith("sha256=")) {
@@ -138,6 +154,7 @@ function verifyBitbucketSignature(rawBody, signatureHeader, secret) {
   const provided = signatureHeader.slice("sha256=".length);
   const expected = createHmac("sha256", secret).update(rawBody, "utf8").digest("hex");
 
+  // timingSafeEqual avoids leaking how much of the signature matched.
   try {
     const a = Buffer.from(provided, "hex");
     const b = Buffer.from(expected, "hex");
@@ -147,11 +164,97 @@ function verifyBitbucketSignature(rawBody, signatureHeader, secret) {
   }
 }
 
+/** Escape characters that Slack treats specially inside message text. */
 function escapeSlack(value) {
   return String(value)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
+}
+
+/**
+ * Build a comma-separated reviewer list for Slack.
+ * Uses `pullrequest.reviewers`, or participants with role REVIEWER as a fallback.
+ *
+ * When SLACK_BOT_TOKEN + COMPANY_EMAIL_DOMAIN are set, resolves each reviewer to a
+ * Slack member ID via email (nickname@domain) and posts a real @mention.
+ */
+async function formatReviewers(pr) {
+  const fromReviewers = Array.isArray(pr.reviewers) ? pr.reviewers : [];
+  const fromParticipants = Array.isArray(pr.participants)
+    ? pr.participants
+        .filter((p) => p?.role === "REVIEWER")
+        .map((p) => p.user)
+        .filter(Boolean)
+    : [];
+
+  const users = fromReviewers.length > 0 ? fromReviewers : fromParticipants;
+  if (users.length === 0) return "_none assigned_";
+
+  const mentions = await Promise.all(users.map((user) => resolveReviewerMention(user)));
+  return mentions.join(", ");
+}
+
+/**
+ * Prefer a real Slack @mention when we can map Bitbucket → company email → Slack user.
+ * Falls back to display name when lookup is unavailable or fails.
+ */
+async function resolveReviewerMention(user) {
+  const display =
+    user.display_name || user.nickname || user.username || "Unknown";
+  const email = guessCompanyEmail(user);
+  if (!email) return escapeSlack(display);
+
+  const slackUserId = await lookupSlackUserIdByEmail(email);
+  if (!slackUserId) return escapeSlack(display);
+
+  // Slack notifies the user when the message contains <@MEMBER_ID>.
+  return `<@${slackUserId}>`;
+}
+
+/**
+ * Bitbucket webhooks rarely include email. If both products use the same company
+ * address, build it as `{nickname|username}@{COMPANY_EMAIL_DOMAIN}`.
+ * Also accepts email_address / email when Bitbucket does send them.
+ */
+function guessCompanyEmail(user) {
+  const explicit = user.email_address || user.email;
+  if (explicit) return String(explicit).trim().toLowerCase();
+
+  const domain = (process.env.COMPANY_EMAIL_DOMAIN || "").trim().replace(/^@/, "");
+  const local = (user.nickname || user.username || "").trim().toLowerCase();
+  if (!domain || !local) return null;
+
+  return `${local}@${domain}`;
+}
+
+/**
+ * Slack Web API: users.lookupByEmail
+ * Requires SLACK_BOT_TOKEN with users:read.email (and email visible on the Slack profile).
+ */
+async function lookupSlackUserIdByEmail(email) {
+  const token = process.env.SLACK_BOT_TOKEN;
+  if (!token) return null;
+
+  try {
+    const url = new URL("https://slack.com/api/users.lookupByEmail");
+    url.searchParams.set("email", email);
+
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await response.json();
+
+    if (!data.ok) {
+      console.warn("Slack users.lookupByEmail failed", email, data.error);
+      return null;
+    }
+
+    return data.user?.id || null;
+  } catch (error) {
+    console.error("Slack users.lookupByEmail error", email, error);
+    return null;
+  }
 }
 
 /**
