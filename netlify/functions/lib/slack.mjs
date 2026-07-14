@@ -29,6 +29,7 @@ export async function buildReviewerMentions(pullRequest) {
   });
 
   const reviewers = getAssignedReviewers(pullRequest);
+  console.log("[reviewers] reviewers:", reviewers);
   console.log(
     "[reviewers] from Bitbucket:",
     reviewers.map((r) => ({
