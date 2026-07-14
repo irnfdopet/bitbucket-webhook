@@ -16,14 +16,35 @@ export function escapeSlackText(value) {
  */
 export async function buildReviewerMentions(pullRequest) {
   const hardcodedMentions = getHardcodedSlackMentions();
-  if (hardcodedMentions) return hardcodedMentions;
+  if (hardcodedMentions) {
+    console.log("[reviewers] using SLACK_MEMBER_ID override:", hardcodedMentions);
+    return hardcodedMentions;
+  }
+
+  const hasBotToken = Boolean(process.env.SLACK_BOT_TOKEN);
+  const emailDomain = (process.env.COMPANY_EMAIL_DOMAIN || "").trim();
+  console.log("[reviewers] lookup config", {
+    hasBotToken,
+    emailDomain: emailDomain || "(missing)",
+  });
 
   const reviewers = getAssignedReviewers(pullRequest);
+  console.log(
+    "[reviewers] from Bitbucket:",
+    reviewers.map((r) => ({
+      display_name: r.display_name,
+      nickname: r.nickname,
+      username: r.username,
+      email: r.email_address || r.email || null,
+    }))
+  );
+
   if (reviewers.length === 0) return "_none assigned_";
 
   const mentions = await Promise.all(
     reviewers.map((reviewer) => resolveSlackMention(reviewer))
   );
+  console.log("[reviewers] final mentions:", mentions);
   return mentions.join(", ");
 }
 
@@ -85,11 +106,19 @@ async function resolveSlackMention(reviewer) {
     "Unknown";
 
   const email = guessReviewerEmail(reviewer);
-  if (!email) return escapeSlackText(displayName);
+  if (!email) {
+    console.warn("[reviewers] no email for", displayName, "- falling back to name");
+    return escapeSlackText(displayName);
+  }
 
+  console.log("[reviewers] looking up Slack user for", displayName, "→", email);
   const slackMemberId = await lookupSlackMemberIdByEmail(email);
-  if (!slackMemberId) return escapeSlackText(displayName);
+  if (!slackMemberId) {
+    console.warn("[reviewers] no Slack match for", email, "- falling back to name");
+    return escapeSlackText(displayName);
+  }
 
+  console.log("[reviewers] matched", email, "→", slackMemberId);
   return `<@${slackMemberId}>`;
 }
 
