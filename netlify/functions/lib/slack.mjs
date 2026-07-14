@@ -11,8 +11,9 @@ export function escapeSlackText(value) {
 /**
  * Reviewer mentions for Slack.
  * 1. SLACK_MEMBER_ID (comma-separated) — temporary test override
- * 2. Else email lookup via SLACK_BOT_TOKEN + COMPANY_EMAIL_DOMAIN
- * 3. Else Bitbucket display names
+ * 2. Else BITBUCKET_TO_SLACK_EMAILS map → users.lookupByEmail
+ * 3. Else payload email / nickname@COMPANY_EMAIL_DOMAIN → lookup
+ * 4. Else Bitbucket display names
  */
 export async function buildReviewerMentions(pullRequest) {
   const hardcodedMentions = getHardcodedSlackMentions();
@@ -23,19 +24,22 @@ export async function buildReviewerMentions(pullRequest) {
 
   const hasBotToken = Boolean(process.env.SLACK_BOT_TOKEN);
   const emailDomain = (process.env.COMPANY_EMAIL_DOMAIN || "").trim();
+  const emailMap = loadBitbucketEmailMap();
   console.log("[reviewers] lookup config", {
     hasBotToken,
     emailDomain: emailDomain || "(missing)",
+    mappedIdentities: Object.keys(emailMap).length,
   });
 
   const reviewers = getAssignedReviewers(pullRequest);
-  console.log("[reviewers] reviewers:", reviewers);
   console.log(
     "[reviewers] from Bitbucket:",
     reviewers.map((r) => ({
       display_name: r.display_name,
       nickname: r.nickname,
       username: r.username,
+      account_id: r.account_id,
+      uuid: r.uuid,
       email: r.email_address || r.email || null,
     }))
   );
@@ -123,8 +127,23 @@ async function resolveSlackMention(reviewer) {
   return `<@${slackMemberId}>`;
 }
 
-/** Prefer payload email; else `{nickname}@{COMPANY_EMAIL_DOMAIN}`. */
+/**
+ * Resolve Slack email for a Bitbucket user.
+ * Prefer explicit map (nickname ≠ email local-part), then payload email,
+ * then nickname@COMPANY_EMAIL_DOMAIN as a last resort.
+ */
 function guessReviewerEmail(reviewer) {
+  const mappedEmail = lookupMappedEmail(reviewer);
+  if (mappedEmail) {
+    console.log(
+      "[reviewers] email from BITBUCKET_TO_SLACK_EMAILS for",
+      reviewer.display_name || reviewer.nickname,
+      "→",
+      mappedEmail
+    );
+    return mappedEmail;
+  }
+
   const emailFromPayload = reviewer.email_address || reviewer.email;
   if (emailFromPayload) {
     return String(emailFromPayload).trim().toLowerCase();
@@ -135,10 +154,47 @@ function guessReviewerEmail(reviewer) {
     .replace(/^@/, "");
   const emailLocalPart = (reviewer.nickname || reviewer.username || "")
     .trim()
-    .toLowerCase();
+    .toLowerCase()
+    .replace(/\s+/g, ".");
 
   if (!emailDomain || !emailLocalPart) return null;
   return `${emailLocalPart}@${emailDomain}`;
+}
+
+/**
+ * JSON map: Bitbucket account_id / uuid / nickname / display_name → Slack email.
+ * Prefer account_id (stable). Example:
+ * {"712020:3575e368-a67a-45ec-9389-41a95b811dab":"yasiru.damboragama@petdesk.com"}
+ */
+function loadBitbucketEmailMap() {
+  const raw = process.env.BITBUCKET_TO_SLACK_EMAILS;
+  if (!raw) return {};
+
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (error) {
+    console.error("BITBUCKET_TO_SLACK_EMAILS is not valid JSON", error);
+    return {};
+  }
+}
+
+function lookupMappedEmail(reviewer) {
+  const emailMap = loadBitbucketEmailMap();
+  const keys = [
+    reviewer.account_id,
+    reviewer.uuid,
+    reviewer.nickname,
+    reviewer.display_name,
+    reviewer.username,
+  ].filter(Boolean);
+
+  for (const key of keys) {
+    const email = emailMap[key];
+    if (email) return String(email).trim().toLowerCase();
+  }
+
+  return null;
 }
 
 /** Requires SLACK_BOT_TOKEN with users:read.email. */

@@ -39,7 +39,8 @@ The function then looks up `nickname@acme.com` in Slack and tags `<@U…>` so re
 | `SLACK_WEBHOOK_URL` | Yes | Slack Incoming Webhook URL from step 1 |
 | `BITBUCKET_WEBHOOK_SECRET` | Recommended | Long random string (same value you will set in Bitbucket) |
 | `SLACK_BOT_TOKEN` | Optional | Bot token with `users:read.email` — used to resolve reviewers to Slack `@` mentions |
-| `COMPANY_EMAIL_DOMAIN` | Optional | e.g. `yourcompany.com` — builds `{bitbucket-nickname}@{domain}` when Bitbucket omits email |
+| `COMPANY_EMAIL_DOMAIN` | Optional | e.g. `petdesk.com` — only works when Bitbucket nickname matches email local-part |
+| `BITBUCKET_TO_SLACK_EMAILS` | Recommended for tagging | JSON map of Bitbucket `account_id` (or nickname) → Slack email |
 
 5. Deploy the site. Note your site URL, e.g. `https://your-site.netlify.app`.
 
